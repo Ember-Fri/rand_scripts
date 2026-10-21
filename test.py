@@ -15,6 +15,10 @@ Expected layout:
 Usage:
     python rfp_extract.py "C:\\path\\to\\Solicitations"
     python rfp_extract.py "C:\\path\\to\\Solicitations" -o rfp_summary.xlsx
+    python rfp_extract.py "C:\\path\\to\\Solicitations" --no-prompt   # unattended
+
+When no matching .docx is found, the script lists the folder's files and asks
+you to pick one (or skip). Rows are flagged in the Notes column either way.
 
 Requires:  pip install "python-docx>=1.1" openpyxl
 """
@@ -357,15 +361,16 @@ def rfp_number_from_folder(folder_name):
 
 
 def find_docx(folder):
+    """Return (path or None, note, candidates). candidates = [(score, path)], best first."""
     docs = sorted((p for p in folder.rglob("*.docx") if not p.name.startswith("~$")),
                   key=lambda p: len(p.parts))
     if not docs:
-        return None, "No .docx files in folder"
+        return None, "No .docx files in folder", []
     want = normalize_name(folder.name)
 
     for p in docs:                                   # exact match after normalizing
         if normalize_name(p.stem) == want:
-            return p, ""
+            return p, "", []
 
     scored = sorted(((SequenceMatcher(None, want, normalize_name(p.stem)).ratio(), p)
                      for p in docs), key=lambda x: x[0], reverse=True)
@@ -374,18 +379,66 @@ def find_docx(folder):
         note = f"Fuzzy name match ({best_score:.0%}): {best.name}"
         if len(scored) > 1 and scored[1][0] >= best_score - 0.03:
             note += f"; close runner-up {scored[1][1].name} ({scored[1][0]:.0%}), verify"
-        return best, note
+        return best, note, scored
     if len(docs) == 1:
-        return best, f"Weak name match ({best_score:.0%}); used only .docx in folder: {best.name}"
+        return best, f"Weak name match ({best_score:.0%}); used only .docx in folder: {best.name}", scored
     return None, (f"No matching .docx; closest was {best.name} ({best_score:.0%}) "
-                  f"out of {len(docs)} files")
+                  f"out of {len(docs)} files"), scored
+
+
+# Manual selection is on unless --no-prompt is passed, input isn't a terminal,
+# or you answer "q" at a prompt.
+PROMPT_ENABLED = True
+
+
+def choose_file(folder, candidates):
+    """List the folder's files and let the user pick a .docx. Returns a path or None."""
+    global PROMPT_ENABLED
+    selectable = {p for _, p in candidates}
+    others = sorted(p for p in folder.rglob("*")
+                    if p.is_file() and p not in selectable and not p.name.startswith("~$"))
+
+    print(f"\n{'=' * 70}\nNo matching .docx found for folder: {folder.name}")
+    if candidates:
+        print("Word documents (closest name first):")
+        for i, (score, p) in enumerate(candidates, 1):
+            print(f"  {i:>3})  {p.relative_to(folder)}   [{score:.0%} name match]")
+    if others:
+        print("Other files (not selectable; save as .docx to use):")
+        for p in others:
+            print(f"         {p.relative_to(folder)}")
+    if not candidates:
+        print("  (no .docx files to choose from - skipping)")
+        return None
+
+    print("    s)  skip this folder        q)  skip all remaining prompts")
+    while True:
+        try:
+            choice = input(f"Select a file [1-{len(candidates)}, s, q]: ").strip().lower()
+        except EOFError:
+            PROMPT_ENABLED = False
+            return None
+        if choice in ("s", ""):
+            return None
+        if choice == "q":
+            PROMPT_ENABLED = False
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+            return candidates[int(choice) - 1][1]
+        print("  Not a valid choice, try again.")
 
 
 def process_folder(folder):
     row = {"RFP Number": rfp_number_from_folder(folder.name),
            "Short Description": "", "Scope of Work": "",
            "Folder": folder.name, "Notes": []}
-    path, note = find_docx(folder)
+    path, note, candidates = find_docx(folder)
+    if path is None and PROMPT_ENABLED:
+        path = choose_file(folder, candidates)
+        if path is not None:
+            note = f"Manually selected: {path.relative_to(folder)}"
+        elif candidates:
+            note += "; skipped at manual selection"
     if note:
         row["Notes"].append(note)
     if path is None:
@@ -445,7 +498,12 @@ def main():
     ap = argparse.ArgumentParser(description="Extract RFP/IFB info into Excel.")
     ap.add_argument("root", type=Path, help="Folder containing the RFP/IFB folders")
     ap.add_argument("-o", "--output", type=Path, default=Path("rfp_summary.xlsx"))
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="Don't ask to pick a file when no match is found; just flag the row")
     args = ap.parse_args()
+
+    global PROMPT_ENABLED
+    PROMPT_ENABLED = not args.no_prompt and sys.stdin.isatty()
 
     if not args.root.is_dir():
         sys.exit(f"Not a directory: {args.root}")
